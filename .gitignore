@@ -16,3 +16,4 @@
 dist/
 pipenv/
 fiasco.egg-info
+*.swp
