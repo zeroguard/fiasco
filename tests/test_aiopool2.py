@@ -10,6 +10,7 @@ Create task.
 """
 
 import time
+import random
 import asyncio
 
 from functools import partial
@@ -23,10 +24,10 @@ class TaskPoolMapResult:
     def __init__(self, args, result, exc, start_ts, end_ts, index):
         """."""
         self.args = args
-        self.result = result
+        self._result = result
 
         assert isinstance(exc, (Exception, NoneType))
-        self.exc = exc
+        self._exc = exc
 
         assert isinstance(start_ts, float)
         self.start_ts = start_ts
@@ -45,6 +46,17 @@ class TaskPoolMapResult:
     def __repr__(self):
         return "<{}: index={}, exec_time={:.3f}s>".format(
             self.__class__.__name__, self.index, self.exec_time)
+
+    def result(self):
+        """Raise exception or returns result."""
+        # should we re-raise as an exception?
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+    def exception(self):
+        """Returns exception."""
+        return self._exc
 
 
 class TaskPool:
@@ -74,13 +86,36 @@ class TaskPool:
         self._task_sem.release()
         self._tasks.remove(task)
 
-
-    async def map(self, coroutine, iterable, return_exceptions=False):
-        tpm = TaskPoolMap(pool=self, size=self._size, 
+    def map(self, coroutine, iterable, return_exceptions=False):
+        """."""
+        return TaskPoolMap(pool=self, size=self._size, 
             coroutine=coroutine, iterable=iterable,
             return_exceptions=return_exceptions)
 
-        return [ x async for x in tpm ]
+
+# TODO: not even sure if we need this lol
+class TaskPoolMapStats:
+
+    def __init__(self):
+        self._counters = []
+        self._is_enabled = False
+
+    @property
+    def is_enabled(self):
+        return self._is_enabled
+
+    def enable(self):
+        self._is_enabled = True
+
+    def disable(self):
+        self._is_enabled = False
+
+    def add_task_timing(self, ts, secs):
+        self._counters += [(ts, secs)]
+    
+    @property
+    def tasks_per_sec(self):
+        pass
 
 
 class TaskPoolMap:
@@ -98,6 +133,12 @@ class TaskPoolMap:
         self._lock = asyncio.Lock()
         self._tasks = set()
         self._has_tasks = asyncio.Event()
+        self._stats = TaskPoolMapStats()
+        self._counters = []
+
+    @property
+    def stats(self):
+        return self._stats
 
     @property
     def loop(self):
@@ -105,56 +146,63 @@ class TaskPoolMap:
 
     async def __aiter__(self):
         """."""
-        try:
-            # start processing items
-            await self.start()
-            
-            # continue until tasks have been processed
-            while True:
-                # did we finish populating tasks?
-                if self._process_iterable_task.done():
-                    # did we encounter an error during population?
-                    exc = self._process_iterable_task.exception()
-                    if exc:
-                        print('failed to populate tasks')
-                        raise exc
+        # continue until tasks have been processed
+        while True:
+            # did we finish populating tasks?
+            if self._process_iterable_task.done():
+                # did we encounter an error during population?
+                exc = self._process_iterable_task.exception()
+                if exc:
+                    print('failed to populate tasks')
+                    raise exc
 
-                    # do we have any tasks needing to be processing?
-                    if not self._tasks:
-                        print('nothing left to do')
-                        return
-
-                # do we have any tasks?
+                # do we have any tasks needing to be processing?
                 if not self._tasks:
-                    # unset flag to prevent cpu spin
-                    self._has_tasks.clear()
+                    print('nothing left to do')
+                    return
+
+            # do we have any tasks?
+            if not self._tasks:
+                # unset flag to prevent cpu spin
+                self._has_tasks.clear()
 
                 # wait until we have some tasks
+                # XXX: is this in the right place?
                 await self._has_tasks.wait()
 
-                # do we have any completed tasks?
-                completed, pending = await asyncio.wait(self._tasks,
-                    loop=self.loop, timeout=0.1, return_when=asyncio.ALL_COMPLETED)
+            # do we have any completed tasks?
+            completed, pending = await asyncio.wait(self._tasks,
+                loop=self.loop, timeout=0.5, return_when=asyncio.ALL_COMPLETED)
 
-                # process each completed task
-                for task in completed:
-                    # remove task from working set
-                    self._tasks.remove(task)
+            # process each completed task
+            for task in completed:
+                # remove task from working set
+                self._tasks.remove(task)
 
-                    # handle result
-                    try:
-                        result = (await task)
-                        assert isinstance(result, TaskPoolMapResult) # TODO: improve cname
-                        # TODO: should we raise result exceptions here?
-                    except:
-                        print('TODO: something bad happened')
-                        raise
-                    else:
-                        yield result
+                # handle result
+                try:
+                    # fetch result
+                    tpmr = (await task)
+                    assert isinstance(tpmr, TaskPoolMapResult)
+                except Exception as exc:
+                    raise
 
-        finally:
-            # stop processing items
-            await self.stop()
+                # do we need to re-raise exception?
+                if not self._return_exceptions:
+                    exc = tpmr.exception()
+                    if exc:
+                        raise exc
+
+                yield tpmr
+
+    async def __aenter__(self, *args, **kwargs):
+        """."""
+        await self.start()
+        return self
+
+    async def __aexit__(self, *args, **kwargs):
+        """."""
+        await self.stop()
 
     async def start(self):
         """."""
@@ -177,15 +225,21 @@ class TaskPoolMap:
 
         t = asyncio.Task.current_task()
 
+        tr_result = None
+        tr_exc = None
         tr_start_ts = time.time()
+
         try:
-            tr_result = None
-            tr_exc = None
             tr_result = await self._coroutine(i)
         except Exception as exc:
             tr_exc = exc
 
         tr_end_ts = time.time()
+
+        # should we increment stats counters?
+        if self.stats.is_enabled:
+            tr_delta = (tr_end_ts - tr_start_ts)
+            self.stats.add_task_timing(tr_end_ts, tr_delta)
 
         return TaskPoolMapResult(
             args=i,
@@ -216,17 +270,19 @@ class TaskPoolMap:
 
 
 async def wait_and_echo(x):
-    import random
     i = random.random()
     await asyncio.sleep(i)
-    print('inside', x, i)
+    #print('inside', x, i)
+    return i
 
 
 async def main():
-    items = range(100)
+    items = range(10_000_000)
     tp = TaskPool(32)
-    results = await tp.map(wait_and_echo, items)
-    for result in results:
-        print(result)
+
+    async with tp.map(wait_and_echo, items) as results:
+        results.stats.enable()
+        async for result in results:
+            print(result)
 
 asyncio.run(main())
