@@ -8,7 +8,7 @@ ENV_FILE=.env
 # Configurable constants block
 ###############################################################################
 DC := docker-compose
-PACKAGE_NAME := pytaskpool
+PACKAGE_NAME := fiasco
 PIPENV_CMD_RUN := pipenv run
 
 DOCKER_PROJECT := zeroguard
