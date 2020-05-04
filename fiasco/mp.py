@@ -1,24 +1,26 @@
-#!/usr/bin/env python3
-
+"""Mptask module."""
+# flake8: noqa
+# pylama:ignore=W0611:
 import sys
 import logging
 import time
-import coloredlogs
 import multiprocessing
 import signal
 import os
 
-# shared shutdown flag
+# Shared shutdown flag
 
 SHUTDOWN_MODE_SOFT = 1
 SHUTDOWN_MODE_HARD = 2
 SHUTDOWN_MODE_NUCLEAR = 3
 
 
+# pylint: disable=R0903
 class ProcessContext:
     """."""
 
     def __init__(self, name, shutdown_flag):
+        """."""
         self.name = name
         self._shutdown_flag = shutdown_flag
 
@@ -28,7 +30,7 @@ class ProcessContext:
         return self._shutdown_flag.is_set()
 
 
-class MultiProcessGroup:
+class TaskManager:
     """."""
 
     def __init__(self):
@@ -38,7 +40,7 @@ class MultiProcessGroup:
         self._shutdown_stage = None
         self.logger = logging.getLogger(__name__)
 
-    def _handle_proc_sigterm(self, signal, frame):
+    def _handle_proc_sigterm(self):
         """."""
         self.logger.info('hard shutdown')
         sys.exit(254)
@@ -55,24 +57,26 @@ class MultiProcessGroup:
 
     def run(self, func, func_args=None, func_kwargs=None, name=None):
         """."""
-
         ctx = ProcessContext(name, self._shutdown_flag)
 
         func_args = func_args if func_args else []
         func_kwargs = func_kwargs if func_kwargs else {}
 
-        p = multiprocessing.Process(target=self._run_func,
-            args=(func, ctx, *func_args), kwargs=func_kwargs)
-        self._procs += [p]
+        proc = multiprocessing.Process(
+            target=self._run_func,
+            args=(func, ctx, *func_args),
+            kwargs=func_kwargs
+        )
+        self._procs += [proc]
 
         default_handler = signal.getsignal(signal.SIGINT)
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-            p.start()
+            proc.start()
         finally:
             signal.signal(signal.SIGINT, default_handler)
 
-        return p
+        return proc
 
     def shutdown(self):
         """."""
@@ -125,52 +129,3 @@ class MultiProcessGroup:
                 time.sleep(0.5)
             except KeyboardInterrupt:
                 self.shutdown()
-
-
-
-
-'''
-    #default_handler = signal.getsignal(signal.SIGTERM)
-    #signal.signal(signal.SIGTERM, signal_handler)
-    ctx.send_message('queue1', 28463)
-
-    ctx.send_message # add to queue, only one worker picks it up
-    ctx.notify_worker_group('worker') # add to queue, all workers pick it up
-
-    ctx.comms.subscribe
-    ctx.comms.publish
-
-
-    subscribe()
-
-
-# Worker 1
-#   - shutdown everything
-#     - send to queue?
-
-# Worker 2
-
-# Main Process
-#   -
-
-class Comms:
-    """."""
-
-    def publish(self, name, msg):
-        pass
-
-    def subscribe(self, name):
-        pass
-
-
-
-class ProcessWorker:
-    """."""
-
-    def __init__(self, name):
-        self.name = name
-        self.logger = logging.getLogger('worker:'+self.name)
-
-    def __str__(self):
-        return "<{}: {}>".format(self.__class__.__name__, self.name)
-'''

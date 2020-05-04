@@ -1,26 +1,73 @@
-#!/usr/bin/env python3
-
-"""
-Input: 1000 items
-In/Out system (don't populate the queue if items are waiting to be consumed
-etc)
-
-Iterate over each input item
-Create task.
-"""
-
+"""Aio module."""
 import time
-import random
 import asyncio
 
 from functools import partial
 
+LOOP_TICK_SECS = 0.2
+
 NoneType = type(None)
 
+#######################################################################
+# TASK POOL
+#######################################################################
+
+
+# pylint: disable=R0903
+class TaskPool:
+    """."""
+
+    def __init__(self, size, loop=None):
+        """."""
+        self._tasks = set()
+        self.loop = loop if loop else asyncio.get_running_loop()
+
+        self._size = size
+        self._task_sem = asyncio.Semaphore(size)
+        self._tasks = set()
+        self._results = []
+
+    async def _create_task(self, coroutine, *args, **kwargs):
+        """."""
+        await self._task_sem.acquire()
+        task = self.loop.create_task(coroutine(*args, **kwargs))
+
+        task.add_done_callback(
+            partial(self._handle_task_done, task))
+
+        self._tasks.add(task)
+        return task
+
+    def _handle_task_done(self, task, future):
+        """."""
+        self._task_sem.release()
+        self._tasks.remove(task)
+
+    async def map(self, coroutine, iterable, return_exceptions=False):
+        """Ordered results."""
+        async with self.imap(coroutine, iterable, return_exceptions) as results:
+            items = [x async for x in results]
+            return sorted(items, key=lambda x: x.index)
+
+    def imap(self, coroutine, iterable, return_exceptions=False):
+        """Unordered results"""
+        return TaskPoolMap(
+            pool=self,
+            size=self._size,
+            coroutine=coroutine,
+            iterable=iterable,
+            return_exceptions=return_exceptions
+        )
+
+
+#######################################################################
+# TASK POOL MAP
+#######################################################################
 
 class TaskPoolMapResult:
     """."""
 
+    # pylint: disable=R0913
     def __init__(self, args, result, exc, start_ts, end_ts, index):
         """."""
         self.args = args
@@ -41,9 +88,10 @@ class TaskPoolMapResult:
     @property
     def exec_time(self):
         """."""
-        return (self.end_ts - self.start_ts)
+        return self.end_ts - self.start_ts
 
     def __repr__(self):
+        """."""
         return "<{}: index={}, exec_time={:.3f}s>".format(
             self.__class__.__name__, self.index, self.exec_time)
 
@@ -55,69 +103,11 @@ class TaskPoolMapResult:
         return self._result
 
     def exception(self):
-        """Returns exception."""
+        """Return exception."""
         return self._exc
 
 
-class TaskPool:
-    def __init__(self, size, loop=None):
-        """."""
-        self._tasks = set()
-        self.loop = loop if loop else asyncio.get_running_loop()
-
-        self._size = size
-        self._task_sem = asyncio.Semaphore(size)
-        self._tasks = set()
-        self._results = []
-
-    async def _create_task(self, awaitable):
-        """."""
-        await self._task_sem.acquire()
-        task = self.loop.create_task(awaitable)
-
-        task.add_done_callback(
-            partial(self._handle_task_done, task))
-
-        self._tasks.add(task)
-        return task
-
-    def _handle_task_done(self, task, future):
-        """."""
-        self._task_sem.release()
-        self._tasks.remove(task)
-
-    def map(self, coroutine, iterable, return_exceptions=False):
-        """."""
-        return TaskPoolMap(pool=self, size=self._size, 
-            coroutine=coroutine, iterable=iterable,
-            return_exceptions=return_exceptions)
-
-
-# TODO: not even sure if we need this lol
-class TaskPoolMapStats:
-
-    def __init__(self):
-        self._counters = []
-        self._is_enabled = False
-
-    @property
-    def is_enabled(self):
-        return self._is_enabled
-
-    def enable(self):
-        self._is_enabled = True
-
-    def disable(self):
-        self._is_enabled = False
-
-    def add_task_timing(self, ts, secs):
-        self._counters += [(ts, secs)]
-    
-    @property
-    def tasks_per_sec(self):
-        pass
-
-
+# pylint: disable=R0902, R0913
 class TaskPoolMap:
     """."""
 
@@ -133,15 +123,11 @@ class TaskPoolMap:
         self._lock = asyncio.Lock()
         self._tasks = set()
         self._has_tasks = asyncio.Event()
-        self._stats = TaskPoolMapStats()
         self._counters = []
 
     @property
-    def stats(self):
-        return self._stats
-
-    @property
     def loop(self):
+        """."""
         return self._pool.loop
 
     async def __aiter__(self):
@@ -171,8 +157,12 @@ class TaskPoolMap:
                 await self._has_tasks.wait()
 
             # do we have any completed tasks?
-            completed, pending = await asyncio.wait(self._tasks,
-                loop=self.loop, timeout=0.5, return_when=asyncio.ALL_COMPLETED)
+            completed, pending = await asyncio.wait(
+                self._tasks,
+                loop=self.loop,
+                timeout=LOOP_TICK_SECS,
+                return_when=asyncio.ALL_COMPLETED
+            )
 
             # process each completed task
             for task in completed:
@@ -185,7 +175,7 @@ class TaskPoolMap:
                     tpmr = (await task)
                     assert isinstance(tpmr, TaskPoolMapResult)
                 except Exception as exc:
-                    raise
+                    raise exc
 
                 # do we need to re-raise exception?
                 if not self._return_exceptions:
@@ -212,18 +202,26 @@ class TaskPoolMap:
 
     async def stop(self):
         """."""
-        if not self._lock.locked():
+        # do we need to unlock?
+        if self._lock.locked():
+            self._lock.release()
+
+        # skip cancelling tasks if loop is closed
+        if self.loop.is_closed():
             return
 
-        self._lock.release()
-
+        # stop processing iterable
         if not self._process_iterable_task.done():
             self._process_iterable_task.cancel()
-    
+
+        # cancel any remaining tasks in the queue
+        for task in self._tasks:
+            if task.cancelled():
+                task.cancel()
+
     async def _process_item(self, i):
         """."""
-
-        t = asyncio.Task.current_task()
+        task = asyncio.current_task()
 
         tr_result = None
         tr_exc = None
@@ -236,18 +234,15 @@ class TaskPoolMap:
 
         tr_end_ts = time.time()
 
-        # should we increment stats counters?
-        if self.stats.is_enabled:
-            tr_delta = (tr_end_ts - tr_start_ts)
-            self.stats.add_task_timing(tr_end_ts, tr_delta)
-
+        # pylint: disable=W0212
         return TaskPoolMapResult(
             args=i,
             result=tr_result,
             exc=tr_exc,
             start_ts=tr_start_ts,
             end_ts=tr_end_ts,
-            index=t._index)
+            index=task._index
+        )
 
     async def _process_iterable(self):
         """."""
@@ -256,10 +251,13 @@ class TaskPoolMap:
         idx = -1
         for i in self._iterable:
             idx += 1
-            awaitable = self._process_item(i)
 
             # create new task
-            task = await self._pool._create_task(awaitable)
+            # pylint: disable=W0212
+            task = await self._pool._create_task(
+                self._process_item,
+                i
+            )
             task._index = idx
 
             # add task to working set
@@ -267,22 +265,3 @@ class TaskPoolMap:
 
             # flag that we are now processing tasks
             self._has_tasks.set()
-
-
-async def wait_and_echo(x):
-    i = random.random()
-    await asyncio.sleep(i)
-    #print('inside', x, i)
-    return i
-
-
-async def main():
-    items = range(10_000_000)
-    tp = TaskPool(32)
-
-    async with tp.map(wait_and_echo, items) as results:
-        results.stats.enable()
-        async for result in results:
-            print(result)
-
-asyncio.run(main())
